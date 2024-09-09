@@ -17,7 +17,6 @@
 
 import numpy as np
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.animation as animation
 from scipy.spatial import KDTree
 from typing import List, Dict, Tuple, Any
@@ -25,7 +24,7 @@ import copy
 import logging
 from dataclasses import dataclass
 
-# 로깅 설정
+# logging setting
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -38,16 +37,17 @@ class Settings:
     max_neighbors: int
     time_horizon: float
     velocity: np.ndarray
+    obstacle_radius: float
 
-# 사용자 정의 파라미터
 settings = Settings(
-    max_speed=2.0,
-    radius=7.0,
-    time_step=0.125,
-    neighbor_dist=19.0,
-    max_neighbors=5,
-    time_horizon=3.0,
-    velocity=np.array([1.0, 1.0, 1.0])
+    max_speed=30.0,
+    radius=7.0,                 
+    time_step=0.05,            
+    neighbor_dist= 2 * 30,     
+    max_neighbors=5,            
+    time_horizon=3.0,           
+    velocity=np.array([0.0, 0.0, 0.0]),
+    obstacle_radius = 10.0
 )
 
 class Plane:
@@ -55,14 +55,18 @@ class Plane:
         self.point: np.ndarray = point
         self.normal: np.ndarray = normal
 
-def find_neighbors(agents: np.ndarray, settings: Settings) -> List[Dict[str, Any]]:
+def find_neighbors(agents: np.ndarray, velocities: np.ndarray, settings: Settings) -> List[Dict[str, Any]]:
     tree = KDTree(agents)
     distances, indices = tree.query(agents, k=settings.max_neighbors + 1)
     
     neighbors_list = []
-    for i, (agent, agent_distances, agent_indices) in enumerate(zip(agents, distances, indices)):
+    for i, (agent, agent_velocity, agent_distances, agent_indices) in enumerate(zip(agents, velocities, distances, indices)):
         agent_info = {
-            'agent': {'id': i, 'me_coords': tuple(agent), 'velocity': settings.velocity},
+            'agent': {
+                'id': i, 
+                'me_coords': tuple(agent), 
+                'velocity': agent_velocity
+            },
             'neighbors': []
         }
         for dist, idx in zip(agent_distances[1:], agent_indices[1:]):
@@ -71,6 +75,7 @@ def find_neighbors(agents: np.ndarray, settings: Settings) -> List[Dict[str, Any
                 agent_info['neighbors'].append({
                     'agent_id': idx,
                     'agent_coords': tuple(neighbor_agent),
+                    'velocity': velocities[idx],
                     'distance': dist,
                     'collision': dist <= settings.radius * 2
                 })
@@ -80,9 +85,10 @@ def find_neighbors(agents: np.ndarray, settings: Settings) -> List[Dict[str, Any
 
 def compute_new_velocity(pref_velocity: np.ndarray, agent_info: Dict[str, Any], settings: Settings) -> np.ndarray:
     orca_planes = []
+    current_velocity = np.array(agent_info['agent']['velocity'])
     for neighbor in agent_info['neighbors']:
         relative_position = np.array(neighbor['agent_coords']) - np.array(agent_info['agent']['me_coords'])
-        relative_velocity = settings.velocity - np.array([0, 0, 0])
+        relative_velocity = np.array(neighbor['velocity']) - current_velocity
         dist_sq = neighbor['distance'] ** 2
         combined_radius = settings.radius * 2
         combined_radius_sq = combined_radius ** 2
@@ -118,34 +124,28 @@ def compute_new_velocity(pref_velocity: np.ndarray, agent_info: Dict[str, Any], 
             plane.normal = w / w_length if w_length > 0 else np.zeros(3)
             u = (combined_radius / settings.time_step - w_length) * plane.normal
 
-        plane.point = settings.velocity + 0.5 * u
+        plane.point = current_velocity + 0.5 * u
         orca_planes.append(plane)
 
-    new_velocity, plane_leng = linear_program3(orca_planes, settings.max_speed, pref_velocity, False, np.array([1, 1, 1]))
-    
+    new_velocity, plane_leng = linear_program3(orca_planes, settings.max_speed, pref_velocity, False, current_velocity)
     if plane_leng < len(orca_planes):
         new_velocity = linear_program4(orca_planes, plane_leng, settings.max_speed, new_velocity)
-
     if np.linalg.norm(new_velocity) == 0:
         random_factors = np.random.uniform(0, 0.2, size=3)
         new_velocity = pref_velocity * random_factors
-    
-    # xy 평면에서만 시뮬레이션 테스트 할 때
-    # new_velocity[-1] = 0
-
+    # only test for x-y plane
+    new_velocity[-1] = 0
     return new_velocity
 
 def linear_program1(planes: List[Plane], plane_no: int, line: Tuple[np.ndarray, np.ndarray], radius: float, opt_velocity: np.ndarray, direction_opt: bool, result: np.ndarray) -> bool:
-    dot_product = line[0].dot(line[1]) # 실수값
+    dot_product = line[0].dot(line[1]) 
     discriminant = dot_product * dot_product + radius * radius - line[0] @ line[0] 
-    print(f'<Agent> linear_program1: discriminant={discriminant} = {dot_product * dot_product} + {radius * radius} + {line[0] * line[0]}') # 3차원 nd어레이값
     if discriminant < 0.0:
         return False
 
     sqrt_discriminant = np.sqrt(discriminant)
     t_left = -dot_product - sqrt_discriminant
     t_right = -dot_product + sqrt_discriminant
-    print(f'<Agent> linear_program1: discriminant={discriminant} t_left={t_left} t_right={t_right} plane_no={plane_no}')
     for i in range(plane_no):
         numerator = (planes[i].point - line[0]).dot(planes[i].normal)
         denominator = line[1].dot(planes[i].normal)
@@ -156,7 +156,6 @@ def linear_program1(planes: List[Plane], plane_no: int, line: Tuple[np.ndarray, 
                 continue
 
         t = numerator / denominator
-        print(f'<Agent> linear_program1: i={i} t={t}')
         if denominator >= 0.0:
             t_left = max(t_left, t)
         else:
@@ -203,7 +202,6 @@ def linear_program2(planes: List[Plane], plane_no: int, radius: float, opt_veloc
             plane_result = result - plane_center
             plane_result_length_sq = (plane_result[0] * plane_result[0] + plane_result[1] * plane_result[1] + plane_result[2] * plane_result[2])
             result[:] = plane_center + np.sqrt(plane_radius_sq / plane_result_length_sq) * plane_result
-    print(f'<Agent> linear_program2: plane_center={plane_center} result={result} plane_no={plane_no}')
 
     for i in range(plane_no):
         if planes[i].normal.dot(planes[i].point - result) > 0.0:
@@ -235,7 +233,7 @@ def linear_program3(planes: List[Plane], radius: float, opt_velocity: np.ndarray
             if not linear_program2(planes, i, radius, opt_velocity, direction_opt, new_velocity):
                 new_velocity[:] = temp_result
                 return new_velocity, i
-    print(f'<Agent> linear_program3: direction_opt={direction_opt} result={new_velocity}')
+
     return new_velocity, len(planes)
 
 def linear_program4(planes: List[Plane], begin_plane: int, radius: float, new_velocity: np.ndarray):
@@ -266,26 +264,30 @@ def linear_program4(planes: List[Plane], begin_plane: int, radius: float, new_ve
                 add_plane.normal = plane_normal
                 proj_planes.append(add_plane)
             
-            # temp_result = result.copy() # 얕은 복사인가 깊은 복사인가? 깊은 복사겠지? 
             temp_result = copy.deepcopy(new_velocity) 
 
             if linear_program3(proj_planes, radius, planes[i].normal, True, new_velocity)[1] < len(proj_planes):
                 new_velocity[:] = temp_result
 
             distance = planes[i].normal.dot(planes[i].point - new_velocity)
-            print(f'<Agent> linear_program4: proj_planes={proj_planes} begin_plane={begin_plane} distance={distance} result={new_velocity}')
-    
+
     return new_velocity
 
-def reached_goals(agents: np.ndarray, goals: np.ndarray, threshold: float = 1.0) -> bool:
+def reached_goals(agents: np.ndarray, goals: np.ndarray, threshold: float = 2.0) -> bool:
     return np.all(np.linalg.norm(agents - goals, axis=1) < threshold)
 
-def update(frame: int, agents: np.ndarray, goals: np.ndarray, scatter: plt.scatter, settings: Settings) -> Tuple[plt.scatter]:
-    if not reached_goals(agents, goals):
-        neighbors_list = find_neighbors(agents, settings)
+def update(frame: int, agents: np.ndarray, velocities: np.ndarray, goals: np.ndarray, scatter: plt.scatter, settings: Settings, time_text: plt.Text, elapsed_time: float) -> Tuple[plt.scatter, plt.Text, float]:
+    if not reached_goals(agents[:-1], goals[:-1]): 
+        neighbors_list = find_neighbors(agents, velocities, settings)
         for i, info in enumerate(neighbors_list):
+            if i == len(agents) - 1:  
+                continue  
+            
             pref_velocity = goals[i] - agents[i]
-            pref_velocity = pref_velocity / np.linalg.norm(pref_velocity) * settings.max_speed
+            if np.linalg.norm(pref_velocity) > 1e-6:
+                pref_velocity = pref_velocity / np.linalg.norm(pref_velocity) * settings.max_speed
+            else:
+                pref_velocity = np.zeros(3)
             
             if info['neighbors']:
                 new_velocity = compute_new_velocity(pref_velocity, info, settings)
@@ -295,108 +297,101 @@ def update(frame: int, agents: np.ndarray, goals: np.ndarray, scatter: plt.scatt
             else:
                 new_velocity = pref_velocity
 
-            agents[i] += new_velocity
+            agents[i] += new_velocity * settings.time_step
+            velocities[i] = new_velocity
+        
+        # Keep the obstacle stationary
+        velocities[-1] = np.zeros(3)
         
         scatter._offsets3d = (agents[:, 0], agents[:, 1], agents[:, 2])
         logger.info(f"Frame {frame}: Agents updated")
 
-    return (scatter,)
+        elapsed_time += settings.time_step
+    
+    else:
+        logger.info("All agents have reached their goals. Stopping time measurement.")
+    
+    # update time
+    time_text.set_text(f'Time: {elapsed_time:.2f} s')
+
+    return scatter, time_text, elapsed_time
+
 
 # def setup_scenario() -> Tuple[np.ndarray, np.ndarray]:
-#     agents = np.array([
-#         [-101, -100, -100], [-100, -103,  100], [-104,  100, -104], [-103,  100,  100],
-#         [ 100, -100, -100], [ 100, -104,  100], [ 101,  100, -101], [ 103,  104,  100]
-#     ], dtype=float)
-#     goals = -agents
-#     return agents, goals
-
-# def setup_scenario() -> Tuple[np.ndarray, np.ndarray]:
-#     num_agents = 16
+#     num_agents = 40
 #     radius = 100
-
-#     # 구면 좌표계에서 임의의 점 생성
-#     theta = np.random.uniform(0, 2*np.pi, num_agents)  # 방위각
-#     phi = np.random.uniform(0, np.pi, num_agents)      # 극각
-
-#     # 구면 좌표계를 직교 좌표계로 변환
+#     theta = np.random.uniform(0, 2*np.pi, num_agents)  
+#     phi = np.random.uniform(0, np.pi, num_agents)     
 #     x = radius * np.sin(phi) * np.cos(theta)
 #     y = radius * np.sin(phi) * np.sin(theta)
 #     z = radius * np.cos(phi)
-
-#     # agents 배열 생성
 #     agents = np.column_stack((x, y, z))
-
-#     # goals는 agents의 반대 지점
 #     goals = -agents
+#     return agents, goals
 
+
+# def setup_scenario() -> Tuple[np.ndarray, np.ndarray]:
+#     num_agents = 10
+#     radius = 100
+#     theta = np.random.uniform(0, 2 * np.pi, num_agents)  
+#     x = radius * np.cos(theta)
+#     y = radius * np.sin(theta)
+#     z = np.zeros(num_agents) 
+#     agents = np.column_stack((x, y, z))
+#     goals = -agents
 #     return agents, goals
 
 # def setup_scenario() -> Tuple[np.ndarray, np.ndarray]:
-#     num_agents = 30
-
-#     # 지정된 범위 내에서 랜덤하게 agent 위치 생성
-#     agents = np.random.uniform(low=-100, high=100, size=(num_agents, 3))
-
-#     # goals는 agents의 반대 지점
-#     goals = np.array([
-#         [-60, -60, 45],[-60, -60, 30],[-60, -60, -45],
-#         [-50, -50, 60],[-50, -50, 15],[-50, -50, -60],
-#         [-40, -40, 67],[-40, -40, 0],[-40, -40, -67],
-#         [-30, -30, 60],[-30, -30, -15],[-30, -30, -60],
-#         [-20, -20, 45],[-20, -20, -30],[-20, -20, -45],
-#         [20, 20, 45],[20, 20, 30],[20, 20, -45],
-#         [30, 30, 60],[30, 30, 15],[30, 30, -60],
-#         [40, 40, 67],[40, 40, 0],[40, 40, -67],
-#         [50, 50, 60],[50, 50, -15],[50, 50, -60],
-#         [60, 60, 45],[60, 60, -30],[60, 60, -45],
-#     ], dtype=float)
-
+#     num_agents = 100
+#     radius = 100
+#     indices = np.arange(num_agents)
+#     theta = np.pi * (3 - np.sqrt(5)) * indices  
+#     phi = np.arccos(1 - 2 * (indices + 0.5) / num_agents)  
+#     x = radius * np.sin(phi) * np.cos(theta)
+#     y = radius * np.sin(phi) * np.sin(theta)
+#     z = radius * np.cos(phi)
+#     agents = np.column_stack((x, y, z))
+#     goals = -agents
 #     return agents, goals
 
 # def setup_scenario() -> Tuple[np.ndarray, np.ndarray]:
-#     num_agents = 16
-
-#     # Agents: x=-100 평면의 반지름 100인 원 위에 균등 배치
-#     theta = np.linspace(0, 2*np.pi, num_agents, endpoint=False)
-#     agents = np.zeros((num_agents, 3))
-#     agents[:, 0] = -100  # x 좌표
-#     agents[:, 1] = 100 * np.cos(theta)  # y 좌표
-#     agents[:, 2] = 100 * np.sin(theta)  # z 좌표
-
-#     # Goals: x=100 평면의 X 모양으로 균등 배치
-#     goals = np.zeros((num_agents, 3))
-#     goals[:, 0] = 100  # x 좌표
-
-#     # X 모양의 첫 번째 대각선
-#     diagonal1 = np.linspace(-100, 100, num_agents // 2)
-#     goals[:num_agents//2, 1] = diagonal1
-#     goals[:num_agents//2, 2] = diagonal1
-
-#     # X 모양의 두 번째 대각선
-#     diagonal2 = np.linspace(100, -100, num_agents // 2)
-#     goals[num_agents//2:, 1] = diagonal2
-#     goals[num_agents//2:, 2] = -diagonal2
-
+#     num_agents =11 
+#     radius = 100
+#     angles = np.linspace(0, 2 * np.e, num_agents, endpoint=False)  
+#     x = radius * np.cos(angles)   
+#     y = radius * np.sin(angles)  
+#     z = np.zeros(num_agents)      
+#     agents = np.column_stack((x, y, z))
+#     goals = -agents
+#     # print(f'start:{agents}, goal_points:{goals}')
 #     return agents, goals
 
 def setup_scenario() -> Tuple[np.ndarray, np.ndarray]:
-    num_agents = 8
+    num_agents = 19  
     radius = 100
-    # 방위각을 랜덤하게 생성
-    theta = np.random.uniform(0, 2 * np.pi, num_agents)  # 방위각
-    # xy 평면에서의 좌표 계산
-    x = radius * np.cos(theta)
-    y = radius * np.sin(theta)
-    z = np.zeros(num_agents)  # z 좌표는 0으로 설정
-    # agents 배열 생성
+
+    angles = np.linspace(0, 2 * np.pi, num_agents - 1, endpoint=False) 
+    x = radius * np.cos(angles)  
+    y = radius * np.sin(angles)  
+    z = np.zeros(num_agents-1)      
+
     agents = np.column_stack((x, y, z))
-    # goals는 agents의 반대 지점 (xy 평면에서 반대 방향)
     goals = -agents
+
+    obstacle_agent = np.array([[0, 0, 0]])
+    obstacle_goal = np.array([[0, 0, 0]])
+
+    agents = np.vstack((agents, obstacle_agent))
+    goals = np.vstack((goals, obstacle_goal))
+
     return agents, goals
 
 def main():
     agents, goals = setup_scenario()
+    velocities = np.zeros_like(agents) 
     logger.info("Scenario set up completed")
+
+    obstacle_radius = 10.0
 
     fig = plt.figure(figsize=(10, 10))
     ax = fig.add_subplot(111, projection='3d')
@@ -407,16 +402,26 @@ def main():
     ax.set_ylabel('Y')
     ax.set_zlabel('Z')
 
-    scatter = ax.scatter(agents[:, 0], agents[:, 1], agents[:, 2], c='b', s=100, label='Agents')
-    ax.scatter(goals[:, 0], goals[:, 1], goals[:, 2], c='r', s=100, label='Goals')
+    scatter = ax.scatter(agents[:-1, 0], agents[:-1, 1], agents[:-1, 2], c='b', s=100, label='Agents')
+    ax.scatter(goals[:-1, 0], goals[:-1, 1], goals[:-1, 2], c='r', s=100, label='Goals')
+    
+    ax.scatter(agents[-1, 0], agents[-1, 1], agents[-1, 2], c='k', s=obstacle_radius**2, label='Obstacle')
 
-    for agent, goal in zip(agents, goals):
+    for agent, goal in zip(agents[:-1], goals[:-1]):
         ax.plot([agent[0], goal[0]], [agent[1], goal[1]], [agent[2], goal[2]], 'k--', alpha=0.3)
-
+    
+    time_text = ax.text2D(0.05, 0.95, '', transform=ax.transAxes)
     ax.legend()
-
-    anim = animation.FuncAnimation(fig, update, frames=200, fargs=(agents, goals, scatter, settings),
-                                   interval=50, blit=False)
+    
+    elapsed_time = 0.0
+    
+    def update_wrapper(frame):
+        nonlocal elapsed_time
+        result = update(frame, agents, velocities, goals, scatter, settings, time_text, elapsed_time)
+        elapsed_time = result[2]  
+        return result[:2] 
+    
+    anim = animation.FuncAnimation(fig, update_wrapper, frames=2000, interval=50, blit=False)
 
     logger.info("Animation started")
     plt.show()
@@ -424,7 +429,6 @@ def main():
 if __name__ == "__main__":
     main()
 
-# 단위 테스트 예시
 import unittest
 
 class TestORCA(unittest.TestCase):
@@ -436,12 +440,14 @@ class TestORCA(unittest.TestCase):
             neighbor_dist=100.0,
             max_neighbors=5,
             time_horizon=3.0,
-            velocity=np.array([1.0, 1.0, 1.0])
+            velocity=np.array([1.0, 1.0, 1.0]),
+            obstacle_radius = 10.0
         )
 
     def test_find_neighbors(self):
         agents = np.array([[0, 0, 0], [50, 50, 50], [100, 100, 100]])
-        neighbors = find_neighbors(agents, self.settings)
+        velocities = np.array([[1, 1, 1], [1, 1, 1], [1, 1, 1]])
+        neighbors = find_neighbors(agents, velocities, self.settings)
         self.assertEqual(len(neighbors), 3)
         self.assertEqual(len(neighbors[0]['neighbors']), 1)
         self.assertEqual(neighbors[0]['neighbors'][0]['agent_id'], 1)
